@@ -4,7 +4,7 @@
 #   .github/workflows/build.yml          this file
 #   Halcyon-main.zip                     the Halcyon source zip (any name; found by its settings.gradle.kts)
 #   folia-web-min.zip                    the trimmed Folia source (any name; found by its vite.config.ts)
-#   Halcyon-Folia-Visualizer-patch.zip   the patch zip(s) (any name; found by their apply.py / files/ folder)
+#   Halcyon-Folia-Visualizer-patch.zip   the single complete visualizer patch (found by apply.py, files/ and folia-host/)
 # Zips may sit in the repository root, in source/ or in patches/.
 #
 # What it does on the runner (never inside your repo):
@@ -45,7 +45,7 @@ permissions:
 
 concurrency:
   group: halcyon-import-build-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   BUILD_TYPE: ${{ github.event.inputs.build_type || 'release' }}
@@ -67,18 +67,29 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           mapfile -t ZIPS < <(printf '%s\n' ./*.zip source/*.zip patches/*.zip | sort)
-          BASE_ZIP=""
-          FOLIA_ZIP=""
+          BASE_CANDIDATES=()
+          FOLIA_CANDIDATES=()
           for z in "${ZIPS[@]}"; do
             [ -f "$z" ] || continue
             names=$(unzip -Z1 "$z" 2>/dev/null || true)
-            if [ -z "$BASE_ZIP" ] && grep -qE '(^|/)settings\.gradle\.kts$' <<< "$names"; then
-              BASE_ZIP="$z"; continue
-            fi
-            if [ -z "$FOLIA_ZIP" ] && grep -qE '(^|/)vite\.config\.ts$' <<< "$names" && grep -q 'src/components/visualizer/' <<< "$names"; then
-              FOLIA_ZIP="$z"; continue
+            if grep -qE '(^|/)settings\.gradle\.kts$' <<< "$names"; then
+              BASE_CANDIDATES+=("$z")
+            elif grep -qE '(^|/)vite\.config\.ts$' <<< "$names" && grep -q 'src/components/visualizer/' <<< "$names"; then
+              FOLIA_CANDIDATES+=("$z")
             fi
           done
+          if [ "${#BASE_CANDIDATES[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one Halcyon source zip containing settings.gradle.kts; found ${#BASE_CANDIDATES[@]}. Remove old/duplicate source zips and keep the intended one."
+            printf 'Detected Halcyon zip: %s\n' "${BASE_CANDIDATES[@]:-none}"
+            exit 1
+          fi
+          if [ "${#FOLIA_CANDIDATES[@]}" -gt 1 ]; then
+            echo "::error::Found ${#FOLIA_CANDIDATES[@]} Folia source zips. Keep only the intended Folia zip; filenames do not select versions."
+            printf 'Detected Folia zip: %s\n' "${FOLIA_CANDIDATES[@]}"
+            exit 1
+          fi
+          BASE_ZIP="${BASE_CANDIDATES[0]}"
+          FOLIA_ZIP="${FOLIA_CANDIDATES[0]:-}"
           if [ -z "$BASE_ZIP" ]; then
             echo "::error::No Halcyon source zip found. Upload the Halcyon zip (it must contain settings.gradle.kts) to the repository root."
             exit 1
@@ -102,14 +113,20 @@ jobs:
             mkdir -p "$RUNNER_TEMP/foliasrc"
             unzip -q "$FOLIA_ZIP" -d "$RUNNER_TEMP/foliasrc"
             FROOT=$(find "$RUNNER_TEMP/foliasrc" -maxdepth 3 -name vite.config.ts -printf '%d %h\n' | sort -n | head -1 | cut -d' ' -f2-)
-            mkdir folia
-            cp -a "$FROOT/." folia/
-            HAVE_FOLIA=true
+            if [ -z "$FROOT" ] || [ ! -f "$FROOT/package.json" ] || [ ! -f "$FROOT/package-lock.json" ]; then
+              echo "::warning::Folia source is missing package.json or package-lock.json; building the native-only app."
+              rm -rf folia
+            else
+              mkdir folia
+              cp -a "$FROOT/." folia/
+              HAVE_FOLIA=true
+            fi
           else
             echo "::warning::No Folia source zip found - the APK will only contain the built-in native styles."
           fi
           echo "HAVE_FOLIA=$HAVE_FOLIA" >> "$GITHUB_ENV"
           echo "FOLIA_ZIP=$FOLIA_ZIP" >> "$GITHUB_ENV"
+          echo "FOLIA_BAKED=false" >> "$GITHUB_ENV"
 
       - name: Apply patch zips
         shell: bash
@@ -121,32 +138,40 @@ jobs:
             echo "Patches are switched off for this run."
           else
             mapfile -t ZIPS < <(printf '%s\n' ./*.zip source/*.zip patches/*.zip | sort)
+            PATCH_CANDIDATES=()
             for p in "${ZIPS[@]}"; do
               [ -f "$p" ] || continue
-              [ "$p" = "$BASE_ZIP" ] && continue
-              [ -n "$FOLIA_ZIP" ] && [ "$p" = "$FOLIA_ZIP" ] && continue
               names=$(unzip -Z1 "$p" 2>/dev/null || true)
-              if ! grep -qE '(^|/)apply\.py$|(^|/)files/|(^|/)folia-host/' <<< "$names"; then
-                echo "Skipping $p (not a patch zip)"
-                continue
+              if grep -qE '(^|/)apply\.py$' <<< "$names" && grep -qE '(^|/)files/' <<< "$names" && grep -qE '(^|/)folia-host/' <<< "$names"; then
+                PATCH_CANDIDATES+=("$p")
               fi
-              d="$RUNNER_TEMP/patch-$(basename "$p" .zip | tr ' ' '_')"
-              rm -rf "$d"; mkdir -p "$d"
-              unzip -q "$p" -d "$d"
-              F=$(find "$d" -maxdepth 2 -type d -name files | head -1 || true)
-              H=$(find "$d" -maxdepth 2 -type d -name folia-host | head -1 || true)
-              A=$(find "$d" -maxdepth 2 -type f -name apply.py | head -1 || true)
-              if [ -n "$F" ]; then cp -a "$F/." build/; fi
-              if [ -n "$H" ] && [ "$HAVE_FOLIA" = "true" ]; then cp -a "$H/." folia/; fi
-              if [ -n "$A" ]; then python3 "$A" "$PWD/build"; fi
-              APPLIED=$((APPLIED + 1))
-              echo "Applied patch: $p"
             done
+            if [ "${#PATCH_CANDIDATES[@]}" -ne 1 ]; then
+              echo "::error::Expected exactly one complete visualizer patch zip; found ${#PATCH_CANDIDATES[@]}. Remove old or duplicate patch zips."
+              printf 'Detected patch zip: %s\n' "${PATCH_CANDIDATES[@]:-none}"
+              exit 1
+            fi
+            p="${PATCH_CANDIDATES[0]}"
+            d="$RUNNER_TEMP/patch-$(basename "$p" .zip | tr ' ' '_')"
+            rm -rf "$d"; mkdir -p "$d"
+            unzip -q "$p" -d "$d"
+            F=$(find "$d" -maxdepth 2 -type d -name files | head -1 || true)
+            H=$(find "$d" -maxdepth 2 -type d -name folia-host | head -1 || true)
+            A=$(find "$d" -maxdepth 2 -type f -name apply.py | head -1 || true)
+            if [ -z "$F" ] || [ -z "$A" ] || [ -z "$H" ]; then
+              echo "::error::The detected patch zip is incomplete; it must contain apply.py, files/, and folia-host/."
+              exit 1
+            fi
+            cp -a "$F/." build/
+            if [ "$HAVE_FOLIA" = "true" ]; then cp -a "$H/." folia/; fi
+            python3 "$A" "$PWD/build"
+            APPLIED=1
+            echo "Applied patch: $p"
           fi
           echo "PATCHES_APPLIED=$APPLIED" >> "$GITHUB_ENV"
           echo "Patch zips applied: $APPLIED"
-          if [ "$HAVE_FOLIA" = "true" ] && [ ! -f folia/halcyon-host.html ]; then
-            echo "::warning::folia/halcyon-host.html is missing (patch zip without the Folia host?). Skipping the Folia bundle."
+          if [ "$HAVE_FOLIA" = "true" ] && { [ ! -f folia/halcyon-host.html ] || [ ! -f folia/vite.halcyon.config.ts ]; }; then
+            echo "::warning::The Folia host entry or build configuration is missing; the APK will use the built-in native styles."
             echo "HAVE_FOLIA=false" >> "$GITHUB_ENV"
           fi
 
@@ -180,7 +205,11 @@ jobs:
         run: |
           set -euo pipefail
           npx vite build -c vite.halcyon.config.ts 2>&1 | tee ../folia-build.log | tail -60
-          test -f dist-halcyon/halcyon-host.html
+          test -s dist-halcyon/halcyon-host.html
+          if ! find dist-halcyon -type f -name '*.js' -size +0c -print -quit | grep -q .; then
+            echo "Folia build produced no non-empty JavaScript bundle."
+            exit 1
+          fi
 
       - name: Bake the Folia bundle into the APK assets
         if: ${{ steps.folia_build.outcome == 'success' }}
@@ -204,8 +233,22 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Build mode summary
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          {
+            echo "## Build summary"
+            echo "- Build type: ${BUILD_TYPE:-unknown}"
+            echo "- Patch archives applied: ${PATCHES_APPLIED:-0}"
+            if [ "${FOLIA_BAKED:-false}" = "true" ]; then
+              echo "- Folia visualizer bundle: included in APK assets"
+            else
+              echo "- Folia visualizer bundle: not included; native visualizer fallback is available"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Application license provenance check
-        continue-on-error: true
         working-directory: build
         run: python3 tools/check_licenses.py
 
@@ -264,8 +307,6 @@ jobs:
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
-        with:
-          build-root-directory: build
 
       - name: Build APK (with patches)
         id: build
